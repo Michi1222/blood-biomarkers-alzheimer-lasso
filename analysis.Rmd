@@ -1,0 +1,380 @@
+---
+title: "Blood-based Gene Expression Biomarkers for Alzheimer's Disease Diagnosis"
+subtitle: "LASSO regularisation and cross-validation using GEO dataset GSE63060"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5)
+```
+
+## 1. Background
+
+Alzheimer's Disease (AD) is the leading cause of dementia worldwide. Early diagnosis is critical but currently relies on expensive or invasive methods (PET, CSF biomarkers). Identifying blood-based gene expression signatures offers a non-invasive, scalable alternative.
+
+This analysis uses **GSE63060**, a publicly available dataset from the NCBI Gene Expression Omnibus (GEO) containing whole-blood gene expression profiles from AD patients and healthy controls. The goal is to apply **LASSO regularisation** with **10-fold cross-validation** to identify a minimal, robust set of gene biomarkers that can distinguish AD cases from controls.
+
+**Key methods used:**
+
+- `GEOquery` to download public data directly from NCBI GEO
+- `glmnet` for LASSO and Elastic Net regularisation
+- `caret` for cross-validated model evaluation
+- Multiple comparison correction (FDR / Benjamini-Hochberg)
+
+---
+
+## 2. Data acquisition
+
+Dataset: **GSE63060**
+- Platform: Illumina HumanHT-12 V3.0 expression beadchip
+- Samples: whole blood from AD patients and age-matched controls
+- Reference: Lunnon et al. (2012), *Molecular Psychiatry*
+
+```{r load_libraries}
+# Install Bioconductor if needed:
+# if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+# BiocManager::install("GEOquery")
+
+library(GEOquery)
+library(limma)
+library(glmnet)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(pheatmap)
+library(caret)
+
+set.seed(42)
+```
+
+```{r download_data, cache=TRUE}
+# Download GSE63060 directly from GEO (requires internet connection)
+gse <- getGEO("GSE63060", GSEMatrix = TRUE, AnnotGPL = TRUE)
+gse <- gse[[1]]
+
+cat("Dataset dimensions:", dim(exprs(gse)), "\n")
+cat("Number of samples:", ncol(exprs(gse)), "\n")
+cat("Number of probes:", nrow(exprs(gse)), "\n")
+```
+
+---
+
+## 3. Data preprocessing
+
+```{r preprocess}
+expr_matrix <- exprs(gse)
+pheno       <- pData(gse)
+
+# stayus
+raw_labels <- pheno[["status:ch1"]]
+cat("Valores únicos en status:ch1:\n")
+print(table(raw_labels))
+
+# AD vs Control (not MCI)
+labels <- case_when(
+  raw_labels == "AD"  ~ "AD",
+  raw_labels == "CTL" ~ "Control",
+  TRUE ~ NA_character_
+)
+
+keep        <- !is.na(labels)
+expr_matrix <- expr_matrix[, keep]
+labels      <- factor(labels[keep], levels = c("Control", "AD"))
+
+cat("\nFinal sample counts:\n")
+print(table(labels))
+```
+
+```{r normalization}
+# Force conversion to plain base R numeric matrix
+expr_matrix <- matrix(
+  as.numeric(expr_matrix),
+  nrow = nrow(expr_matrix),
+  ncol = ncol(expr_matrix),
+  dimnames = list(rownames(expr_matrix), colnames(expr_matrix))
+)
+
+# Remove probes with any NA values
+expr_matrix <- expr_matrix[complete.cases(expr_matrix), ]
+cat("Probes after removing NAs:", nrow(expr_matrix), "\n")
+
+# Log2-transform only if values suggest raw intensities
+if (max(expr_matrix, na.rm = TRUE) > 100) {
+  expr_matrix <- log2(expr_matrix + 1)
+  cat("Log2 transformation applied.\n")
+} else {
+  cat("Data appears already log-scaled. No transformation applied.\n")
+}
+
+expr_norm <- expr_matrix
+
+# Remove probes with very low variance (uninformative)
+probe_var  <- apply(expr_norm, 1, var, na.rm = TRUE)
+var_thresh <- quantile(probe_var, 0.25, na.rm = TRUE)
+expr_filt  <- expr_norm[!is.na(probe_var) & probe_var > var_thresh, ]
+
+cat("Probes after variance filtering:", nrow(expr_filt), "\n")
+cat("Dimensions:", dim(expr_filt), "\n")
+```
+
+---
+
+## 4. Exploratory analysis
+
+### 4.1 Sample distribution before and after normalisation
+
+```{r boxplot_norm, fig.cap="Expression distribution per sample"}
+n_show   <- min(30, ncol(expr_filt))
+idx      <- sample(seq_len(ncol(expr_filt)), n_show)
+n_probes <- min(50, nrow(expr_filt))
+
+mat_sub    <- expr_filt[seq_len(n_probes), idx]
+expr_vals  <- as.numeric(as.vector(mat_sub))
+sample_ids <- as.character(rep(colnames(mat_sub), each = nrow(mat_sub)))
+
+df_box <- data.frame(
+  Expression = expr_vals,
+  Sample     = sample_ids,
+  stringsAsFactors = FALSE
+)
+
+print(head(df_box))  # debug: to confirm columns
+
+ggplot(data = df_box, mapping = aes(x = Sample, y = Expression)) +
+  geom_boxplot(outlier.size = 0.3, fill = "steelblue", alpha = 0.6) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+  labs(title = "Expression distribution (random subset of samples)",
+       subtitle = "After log2 normalisation",
+       x = "Sample", y = "log2 Expression")
+```
+##check 
+```{r diagnostico}
+cat("Clase de expr_filt:", class(expr_filt), "\n")
+cat("Dimensiones de expr_filt:", dim(expr_filt), "\n")
+cat("Número de labels:", length(labels), "\n")
+cat("Tabla de labels:\n")
+print(table(labels))
+cat("NAs en expr_filt:", sum(is.na(expr_filt)), "\n")
+cat("Filas con varianza 0:", sum(apply(expr_filt, 1, var, na.rm=TRUE) == 0, na.rm=TRUE), "\n")
+```
+### 4.2 PCA — do AD and Control cluster separately?
+
+```{r pca, fig.cap="PCA of blood gene expression coloured by diagnosis"}
+# check the NAS
+expr_pca <- expr_filt[apply(expr_filt, 1, function(x) var(x, na.rm=TRUE) > 0), ]
+expr_pca <- na.omit(expr_pca)
+
+cat("Dimensions for PCA:", dim(expr_pca), "\n")
+cat("Samples in labels:", length(labels), "\n")
+
+pca_res <- prcomp(t(expr_pca), scale. = TRUE)
+pca_df  <- data.frame(
+  PC1       = pca_res$x[, 1],
+  PC2       = pca_res$x[, 2],
+  Diagnosis = labels
+)
+
+var_exp <- round(100 * pca_res$sdev^2 / sum(pca_res$sdev^2), 1)
+
+ggplot(pca_df, aes(x = PC1, y = PC2, colour = Diagnosis)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  scale_colour_manual(values = c("Control" = "#2196F3", "AD" = "#F44336")) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "PCA: Blood gene expression — AD vs Control",
+    x     = paste0("PC1 (", var_exp[1], "% variance)"),
+    y     = paste0("PC2 (", var_exp[2], "% variance)")
+  )
+```
+
+---
+
+## 5. Differential expression — identifying candidate genes
+
+Before LASSO, we perform a standard differential expression analysis with `limma` to characterise which genes are altered in AD blood.
+
+```{r limma_DE}
+design <- model.matrix(~ labels)
+fit    <- lmFit(expr_filt, design)
+fit    <- eBayes(fit)
+
+# Extract results with FDR correction (Benjamini-Hochberg)
+top_genes <- topTable(fit, coef = 2, number = Inf, adjust.method = "BH")
+
+# How many genes pass FDR < 0.05?
+n_sig <- sum(top_genes$adj.P.Val < 0.05, na.rm = TRUE)
+cat("Genes significant at FDR < 0.05:", n_sig, "\n")
+
+head(top_genes[, c("logFC", "AveExpr", "t", "P.Value", "adj.P.Val")], 10)
+```
+
+```{r volcano, fig.cap="Volcano plot: differential expression AD vs Control"}
+top_genes$Significant <- top_genes$adj.P.Val < 0.05 & abs(top_genes$logFC) > 0.3
+
+ggplot(top_genes, aes(x = logFC, y = -log10(P.Value), colour = Significant)) +
+  geom_point(size = 0.8, alpha = 0.6) +
+  scale_colour_manual(values = c("FALSE" = "grey70", "TRUE" = "#E53935")) +
+  geom_vline(xintercept = c(-0.3, 0.3), linetype = "dashed", colour = "grey40") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey40") +
+  theme_minimal(base_size = 12) +
+  labs(
+    title    = "Volcano plot — AD vs Control (whole blood)",
+    subtitle = "FDR < 0.05 and |logFC| > 0.3 highlighted in red",
+    x        = "log2 Fold Change",
+    y        = "-log10(p-value)"
+  )
+```
+
+---
+
+## 6. LASSO — biomarker selection
+
+LASSO (Least Absolute Shrinkage and Selection Operator) penalises model complexity by shrinking coefficients of uninformative variables exactly to zero. This achieves simultaneous **variable selection** and regularisation — ideal for high-dimensional biological data where p >> n.
+
+```{r lasso_prep}
+# Use top variable genes as input (reduce dimensionality for LASSO stability)
+top_var_probes <- names(sort(probe_var, decreasing = TRUE))[1:2000]
+X <- t(expr_filt[top_var_probes, ])   # samples x probes matrix
+y <- labels
+
+cat("LASSO input matrix:", dim(X), "\n")
+cat("Class balance:\n")
+print(table(y))
+```
+
+```{r lasso_cv, fig.cap="Cross-validation curve for LASSO (alpha=1)"}
+# 10-fold cross-validated LASSO
+cv_lasso <- cv.glmnet(
+  x        = X,
+  y        = y,
+  family   = "binomial",
+  alpha    = 1,          # alpha=1 → LASSO; alpha=0 → Ridge
+  nfolds   = 10,
+  type.measure = "auc"
+)
+
+plot(cv_lasso)
+title("LASSO: 10-fold CV — AUC vs log(lambda)", line = 3)
+
+cat("\nBest lambda (min AUC):", round(cv_lasso$lambda.min, 5), "\n")
+cat("Best lambda (1SE rule):", round(cv_lasso$lambda.1se, 5), "\n")
+```
+
+```{r lasso_coefs}
+# Extract non-zero coefficients at lambda.min
+coef_lasso  <- coef(cv_lasso, s = "lambda.min")
+selected_idx <- which(coef_lasso[-1, 1] != 0)  # exclude intercept
+selected_probes <- rownames(coef_lasso)[-1][selected_idx]
+selected_coefs  <- coef_lasso[-1, 1][selected_idx]
+
+cat("Probes selected by LASSO:", length(selected_probes), "\n\n")
+
+lasso_results <- data.frame(
+  Probe       = selected_probes,
+  Coefficient = round(selected_coefs, 4)
+) %>% arrange(desc(abs(Coefficient)))
+
+print(lasso_results)
+```
+
+```{r lasso_coef_plot, fig.cap="LASSO selected probes and their coefficients"}
+ggplot(lasso_results, aes(x = reorder(Probe, Coefficient), y = Coefficient,
+                           fill = Coefficient > 0)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "#F44336", "FALSE" = "#2196F3"),
+                    labels = c("Downregulated in AD", "Upregulated in AD")) +
+  theme_minimal(base_size = 11) +
+  labs(
+    title  = "LASSO-selected biomarker probes",
+    subtitle = paste0(length(selected_probes), " probes selected from 2,000 candidates"),
+    x      = "Probe ID",
+    y      = "LASSO coefficient",
+    fill   = NULL
+  ) +
+  theme(legend.position = "bottom")
+```
+
+---
+
+## 7. Elastic Net comparison
+
+Elastic Net combines LASSO (L1) and Ridge (L2) penalties. It performs better than pure LASSO when predictors are correlated — common in gene expression data.
+
+```{r elasticnet, fig.cap="Cross-validation curve for Elastic Net (alpha=0.5)"}
+cv_enet <- cv.glmnet(
+  x            = X,
+  y            = y,
+  family       = "binomial",
+  alpha        = 0.5,    # mix of LASSO and Ridge
+  nfolds       = 10,
+  type.measure = "auc"
+)
+
+plot(cv_enet)
+title("Elastic Net: 10-fold CV — AUC vs log(lambda)", line = 3)
+
+coef_enet    <- coef(cv_enet, s = "lambda.min")
+n_enet       <- sum(coef_enet[-1, 1] != 0)
+cat("Probes selected by Elastic Net:", n_enet, "\n")
+cat("Probes selected by LASSO:       ", length(selected_probes), "\n")
+```
+
+---
+
+## 8. Heatmap of selected biomarkers
+
+```{r heatmap, fig.cap="Heatmap of LASSO-selected probes across AD and Control samples"}
+if (length(selected_probes) >= 2) {
+  expr_selected <- expr_filt[selected_probes, , drop = FALSE]
+
+  ann_col <- data.frame(Diagnosis = labels)
+  rownames(ann_col) <- colnames(expr_selected)
+
+  pheatmap(
+    expr_selected,
+    annotation_col  = ann_col,
+    annotation_colors = list(Diagnosis = c(Control = "#2196F3", AD = "#F44336")),
+    show_colnames   = FALSE,
+    scale           = "row",
+    color           = colorRampPalette(c("#2166AC", "white", "#D6604D"))(100),
+    main            = "LASSO-selected probes: expression across samples",
+    fontsize_row    = 8
+  )
+} else {
+  cat("Too few probes selected to plot heatmap. Try lambda.1se instead.\n")
+}
+```
+
+---
+
+## 9. Summary
+
+| Method | Probes selected | CV AUC (approx.) |
+|---|---|---|
+| LASSO (α=1) | `r length(selected_probes)` | See plot above |
+| Elastic Net (α=0.5) | `r n_enet` | See plot above |
+
+**Key takeaways:**
+
+1. LASSO successfully reduces thousands of probes to a compact, interpretable set of candidate biomarkers.
+2. FDR correction (Benjamini-Hochberg) is essential — testing 2,000+ probes simultaneously without correction would produce hundreds of false positives.
+3. Elastic Net tends to select slightly more probes than LASSO, which may be beneficial when true biomarkers are co-expressed (correlated).
+4. This minimal biomarker set could be validated in independent cohorts (e.g., GSE63061, the companion dataset to GSE63060).
+
+---
+
+## 10. Session info
+
+```{r session_info}
+sessionInfo()
+```
